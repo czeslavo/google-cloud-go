@@ -17,9 +17,12 @@ package firestore
 import (
 	"context"
 	"errors"
+	"os"
+	"sync"
 
+	ipcSync "bitbucket.org/avd/go-ipc/sync"
 	"cloud.google.com/go/internal/trace"
-	gax "github.com/googleapis/gax-go/v2"
+	"github.com/googleapis/gax-go/v2"
 	pb "google.golang.org/genproto/googleapis/firestore/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -69,6 +72,33 @@ var (
 
 type transactionInProgressKey struct{}
 
+var transactionLock sync.Locker
+
+func init() {
+	if os.Getenv("FIRESTORE_EMULATOR_HOST") != "" {
+		// todo: firebase emulator is not able to handle concurrent transactions, and is causing deadlocks
+		// https://github.com/firebase/firebase-tools/issues/2452
+
+		// We need to use IPC based mutex in order to synchronise between test binaries.
+		lock, err := ipcSync.NewRWMutex("firestore-transaction", os.O_CREATE, 0666)
+		if err != nil {
+			panic(err)
+		}
+
+		transactionLock = lock
+	} else {
+		transactionLock = NoopLock{}
+	}
+}
+
+type NoopLock struct {}
+
+func (n NoopLock) Lock() {
+}
+
+func (n NoopLock) Unlock() {
+}
+
 // RunTransaction runs f in a transaction. f should use the transaction it is given
 // for all Firestore operations. For any operation requiring a context, f should use
 // the context it is passed, not the first argument to RunTransaction.
@@ -90,6 +120,9 @@ type transactionInProgressKey struct{}
 // Since f may be called more than once, f should usually be idempotent – that is, it
 // should have the same result when called multiple times.
 func (c *Client) RunTransaction(ctx context.Context, f func(context.Context, *Transaction) error, opts ...TransactionOption) (err error) {
+	transactionLock.Lock()
+	defer transactionLock.Unlock()
+
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/firestore.Client.RunTransaction")
 	defer func() { trace.EndSpan(ctx, err) }()
 
